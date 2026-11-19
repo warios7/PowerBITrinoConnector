@@ -1,0 +1,6 @@
+{
+  "AuthorizationUri": "https://login.microsoftonline.com/<tenant-id>/oauth2/authorize",
+  "Resource": "<Application ID URI from Expose an API>",
+  "Scope": "<delegated scope name>",
+  "GatewayOrigin": "https://<gateway-host>:<https-port>"
+}

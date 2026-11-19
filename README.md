@@ -12,66 +12,55 @@ A Microsoft Power BI Custom Connector for importing Trino data into Power BI to 
 The connector communicates directly with the [Trino client REST API](https://trino.io/docs/current/develop/client-protocol.html) to retrieve data and provides some pararmeters to configure. Client timeout errors (ABANDONED_QUERY) can be fixed by changing the value of query.client.timeout in the coordinators config.properties file (the default is 5 minutes).
 
 ## Authentication
- The supported [Power BI authentication types](https://learn.microsoft.com/en-us/power-query/handling-authentication#authentication-kinds) are Anonymous, Basic (UsernamePassword) and Organizational account (OAuth) which have been successfully tested in the following combinations with Trino:
- 
-Trino Authentication Type                   | Power BI Authentication Type
-:-------------------------------------------|:----------------------------------
-PASSWORD for Password file authentication   | Basic
-PASSWORD for LDAP authentication            | Basic
-OAUTH2 for OAuth 2.0 authentication         | Organizational Account
+Use **Organizational account** in Desktop and **Basic** on the on-premises gateway. Both send credentials over HTTPS. Trino selects the session user from its authenticated identity. The optional User parameter applies only to anonymous connections.
 
 ## Instructions
-If you want to customize the connector or to use OAuth, you will need to build a .mez file yourself by following this step-by-step guide. Otherwise, for just using the connector, you can go right to step 6.
 
-1. Install [Visual Studio Code](https://code.visualstudio.com/) and the [Power Query SDK
-extension](https://marketplace.visualstudio.com/items?itemName=PowerQuery.vscode-powerquery-sdk).
+1. On your Windows development machine, check out `feature/entra-id-oauth`. From the repository root, copy the example to the ignored local build input with PowerShell.
 
-2. Clone this repository and open the folder `Trino` in Visual Studio Code. (If you open the main folder of this repository, then the Power Query SDK extension won't recognise it as an extension project.)
+   ```powershell
+   Copy-Item entra.example.json Trino/entra.local.json
+   notepad Trino/entra.local.json
+   ```
 
-3. (Optional) Modify the file `Trino.pq` as needed, for OAuth in particular the function `TokenMethod`. The current `Trino.pq` has been written for OAuth using [AWS Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/what-is-amazon-cognito.html), but your particular use case may well require a different protocol. See the [official documentation](https://learn.microsoft.com/en-us/power-query/install-sdk) for more information. [This post](https://jussiroine.com/2019/02/building-a-custom-connector-for-power-bi-that-supports-oauth2-to-visualize-my-wellness-data/) is also helpful. Note that changes made to `Trino.pq` may affect which files need to be created in the next step.
+2. Fill in only these four non-secret settings. Every recipient of the built connector can read them.
 
-4. (Optional) For OAuth various files need to be created to store the configuration of your setup. The all begin with the prefix `oauth_config_`, which is included in `.gitignore` to guard against unintenionally committing credentials.
+   | Field | Where to find the value |
+   | --- | --- |
+   | AuthorizationUri | In Microsoft Entra ID, open the resource application's Overview. Use its **Directory (tenant) ID** in the URL pattern in the example. The pattern follows Microsoft's native Power Query Aad configuration for the public cloud. |
+   | Resource | Open **App registrations → the Trino resource application → Expose an API → Application ID URI**. Copy the exact registered value. Its application (client) ID is often part of the URI. |
+   | Scope | Under **Expose an API**, use the short name of an enabled delegated permission for this API. Alternatively use `.default` when the intended permissions have been preauthorized. |
+   | GatewayOrigin | Enter the HTTPS scheme, hostname and port users enter for the Trino gateway, e.g. `https://trino.example.invalid:8443`. Omit paths, queries and credentials. |
 
-    * `oauth_config_client_id.txt`  
-    This should contain your application's Client ID. Don't commit this.
+   Use the coordinator's OAuth client ID to identify the trusted audience. Confirm that the resource application's access token has an accepted audience and issuer. Check the configured principal claim (email in this deployment) and whether the coordinator validates tokens locally or through UserInfo. The Web UI can request tokens for a different resource. Microsoft Graph scopes belong to Graph. For the Desktop flow, the Trino API must expose a delegated permission and authorize the Microsoft Power Query Desktop client for it. The native Aad flow handles the client identifier, token endpoint and renewal. [Microsoft Entra setup](https://learn.microsoft.com/en-us/power-query/configure-microsoft-entra-for-connector) · [Trino OAuth settings](https://trino.io/docs/current/security/oauth2.html)
 
-    * `oauth_config_client_secret.txt`  
-    This should contain your application's Client Secret. _Really_ don't commit this.
+3. Install the Microsoft Power Query SDK in VS Code on Windows. Open the **Trino** subfolder, run **Tasks: Run Build Task**, and choose **Build connector project using MakePQX**. The SDK runs MakePQX.exe. The new package should appear at `Trino/bin/AnyCPU/Debug/Trino.mez`. [SDK guide](https://learn.microsoft.com/en-us/power-query/install-sdk)
 
-    * `oauth_config_authorize_uri.txt`  
-    This should contain the URI of your authorize-endpoint. An example:
-      ```
-      https://<your-app>.auth.<aws-region>.amazoncognito.com/oauth2/authorize
-      ```
+4. From the repository root, verify the package contains the exact local settings and source without displaying either. Save the verified build under the commit ID.
 
-    * `oauth_config_scopes.txt`  
-    This should contain the OAuth scopes. An example:
-      ```
-      openid
-      ```
-      Remark: It should be possible to include more than one scope (space- or comma-seprated?), but this has not been tested.
-    
-    * `oauth_config_token_uri.txt.txt`  
-    This should contain the URI of your token-endpoint. An example:
-      ```
-      https://<your-app>.auth.<aws-region>.amazoncognito.com/oauth2/token
-      ```
+   ```powershell
+   Add-Type -AssemblyName System.IO.Compression.FileSystem
+   $package = 'Trino/bin/AnyCPU/Debug/Trino.mez'
+   $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $package))
+   try {
+       foreach ($name in 'entra.local.json', 'Trino.pq') {
+           $entry = $zip.GetEntry($name)
+           if (!$entry) { throw "Missing package entry $name" }
+           $stream = $entry.Open()
+           try {
+               if ((Get-FileHash -InputStream $stream).Hash -ne (Get-FileHash "Trino/$name").Hash) {
+                   throw "Package differs from build input $name"
+               }
+           } finally { $stream.Dispose() }
+       }
+   } finally { $zip.Dispose() }
+   $version = git rev-parse --short HEAD
+   Copy-Item $package "Trino/bin/Trino-$version.mez"
+   ```
 
-    This information is included in `.gitignore` to not commit it into this public repo.
+5. Back up the installed connector outside the Desktop and gateway connector folders. The original fork package is also preserved at `rollback/Trino.mez`. Install one new copy as `Trino.mez` in the Windows user's `Documents\Power BI Desktop\Custom Connectors` folder. Use your organization's connector trust settings and restart Desktop.
 
-5. The .mez file now needs to be built. In the Command Palette, select "Tasks: Run Build Task" (type "> b" to find it):
-
-    ![Build task](Trino/img/RunBuildTask.png)
-
-    Then select the option to use MakePQX:
-
-    ![Build task](Trino/img/MakePQX.png)
-
-    If all goes well, the file `Trino.mez` should appear in the folder `Trino\\bin\\AnyCPU\\Debug`. 
-
-6. Take the pre-built .mez from this [link](Trino/bin/AnyCPU/Debug/Trino.mez) or if customized from your debug folder and place it in your local `Documents\Power BI Desktop\Custom Connectors` folder, as outlined in the [documentation](https://learn.microsoft.com/en-us/power-query/install-sdk#build-and-deploy). Once done, you should be able to see the connector listed in your "Get Data" window, restart Power BI Desktop in case it doesn't appear:
-
-    ![Power BI Trino Connector Menu](Trino/img/MenuConnector.JPG)
+6. Select **Get Data → Trino**. If Desktop reuses an older credential, clear the saved permission for the test host and port under **Data source settings**. Choose **Organizational account**, sign in with MFA, and leave User empty. Run `SELECT current_user`, browse catalogs and schemas, and load a known multi-page result. Repeat after token expiry. Compare the session user and row count with a trusted Trino client.
 
 7. Populate the required and optional fields to communicate with your Trino environment and hit OK to either scan your objects or to execute a specific SQL query if provided:
 
@@ -86,7 +75,7 @@ extension](https://marketplace.visualstudio.com/items?itemName=PowerQuery.vscode
     ![Power BI Trino Connector Scanner](Trino/img/ScanConnector.JPG)
 
 ## Power BI Service
-To support end-to-end refresh through the Power BI Service on the cloud, it requires you to setup an [on-premise data gateway](https://docs.microsoft.com/en-us/power-bi/connect-data/service-gateway-custom-connectors). Once the connector is officially supported, this is not required anymore.
+Install the same configured package in the custom connector directory on every gateway cluster member. Give the gateway service account read access, reload the gateway service during an approved window, and enable custom connectors for the cluster. Create a **Trino** gateway connection with the identical host and port and select **Basic**. Enter the dedicated least-privilege Trino account in the gateway credential dialog. Bind the semantic model to that connection, run a refresh, then verify a scheduled refresh and the service-account identity in Trino's query history. For rollback, restore the previous package on each host and reload the affected applications. [Gateway setup](https://learn.microsoft.com/en-us/power-bi/connect-data/service-gateway-custom-connectors)
 
 ## Power BI Report Server
 Custom connectors are currently not supported in Power BI Report Server environments. You can find a list of all supported data sources [here](https://docs.microsoft.com/en-us/power-bi/report-server/data-sources).
@@ -95,6 +84,8 @@ Custom connectors are currently not supported in Power BI Report Server environm
 In case you encounter any issues while installing or loading data, just open an issue or feel free to reach out to info@creativedata.io.
 
 ## Releases
+
+**Entra development branch** — Native organizational sign-in for Desktop, independently stored gateway Basic credentials, and authenticated same-origin pagination. Windows and live deployment acceptance tests are pending.
 
 **January 2025**
 - 2025-01-08: Adding [targetResultSize](https://trino.io/docs/current/release/release-0.213.html) as optional parameter to control response data size
