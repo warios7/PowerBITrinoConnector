@@ -35,7 +35,7 @@ shared TrinoType = type function (
     optional User as (type text meta [
         DataSource.Path = false,
         Documentation.FieldCaption = "User",
-        Documentation.FieldDescription = "The user name associated with the query. Default: TrinoPBI",
+        Documentation.FieldDescription = "Anonymous connections only. Authenticated connections use the identity mapped by Trino.",
         Documentation.SampleValues = {"TrinoPBI"}
     ]),
     optional Retries as (type number meta [
@@ -74,33 +74,70 @@ DefaultUser = "TrinoPBI";
 DefaultRetries = 5;
 DefaultTimeout = 100;
 DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
-Http = if (Extension.CurrentCredential()[AuthenticationKind]?) = "Implicit" then "http://" else "https://";
+IsAnonymous = List.Contains({"Anonymous", "Implicit"}, Extension.CurrentCredential()[AuthenticationKind]);
+Http = if IsAnonymous then "http://" else "https://";
 
-TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional SQLQuery as text) as table =>
+// Bind every page to the gateway that received the original statement.
+CheckedPageUrl = (statementUrl as text, nextUrl as text) as text =>
+    let
+        origin = Uri.Parts(statementUrl),
+        page = Uri.Parts(nextUrl)
+    in
+        if Text.StartsWith(nextUrl, origin[Scheme] & "://", Comparer.OrdinalIgnoreCase)
+            and Text.Lower(page[Host]) = Text.Lower(origin[Host])
+            and page[Port] = origin[Port]
+            and List.Contains({null, ""}, page[UserName]?)
+            and List.Contains({null, ""}, page[Password]?)
+            and not Text.Contains(nextUrl, Character.FromNumber(92))
+        then nextUrl
+        else error "Trino returned a pagination URL outside the configured gateway origin.";
+
+TrinoRequest = (url as text, user as nullable text, timeout as number, isRetry as logical, options as record) as binary =>
+    let
+        credential = Extension.CurrentCredential(),
+        kind = credential[AuthenticationKind],
+        headers =
+            if IsAnonymous then [#"X-Trino-User" = user]
+            else if not Text.StartsWith(url, "https://", Comparer.OrdinalIgnoreCase) then
+                error "Authenticated Trino requests require HTTPS."
+            else if List.Contains({"Aad", "OAuth"}, kind) then
+                // Scope the API token to the gateway approved for this resource.
+                if CheckedPageUrl(EntraSetting("GatewayOrigin"), url) = url then
+                    [Authorization = "Bearer " & credential[access_token]]
+                else error "Invalid gateway origin."
+            else if kind = "UsernamePassword" then
+                [Authorization = "Basic " & Binary.ToText(
+                    Text.ToBinary(credential[Username] & ":" & credential[Password], TextEncoding.Utf8),
+                    BinaryEncoding.Base64)]
+            else error "Unsupported Trino credential type.",
+        response = Web.Contents(url, options & [
+            Headers = headers,
+            ManualCredentials = true,
+            ManualStatusHandling = {300..399},
+            Timeout = #duration(0, 0, 0, timeout),
+            IsRetry = isRetry
+        ]),
+        status = Value.Metadata(response)[Response.Status]
+    in
+        if status >= 300 and status < 400 then error "Unexpected redirect from the Trino gateway."
+        else response;
+
+TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional User as nullable text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional SQLQuery as text) as table =>
     let
         Url = Http & Host & ":" & Number.ToText(Port) & "/v1/statement",
+        sessionUser = if IsAnonymous then (User ?? DefaultUser) else null,
         Table = 
             if SQLQuery is null then 
-                TrinoNavTable(Url, Catalog, User, Retries, Timeout, TargetResultSize)
+                TrinoNavTable(Url, Catalog, sessionUser, Retries, Timeout, TargetResultSize)
             else 
                 let
-                    User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
-                        else if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) = "UsernamePassword" then Extension.CurrentCredential()[Username] 
-                        else User,
                     Retries = if Retries is null then DefaultRetries else Retries,
                     Timeout = if Timeout is null then DefaultTimeout else Timeout,
                     response = Value.WaitFor(
                         (iteration) =>
                             let
                                 isRetry = if iteration > 0 then true else false,
-                                response = Web.Contents(Url,
-                                    [
-                                        Content = Text.ToBinary(SQLQuery)
-                                        ,Headers = [#"X-Trino-User" = User]
-                                        ,Timeout = #duration(0, 0, 0, Timeout)
-                                        ,IsRetry = isRetry
-                                    ]
-                                ),
+                                response = TrinoRequest(Url, sessionUser, Timeout, isRetry, [Content = Text.ToBinary(SQLQuery)]),
                                 buffered = Binary.Buffer(response),
                                 responseCode = Value.Metadata(response)[Response.Status],
                                 actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -110,27 +147,20 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
                         Retries
                     ),
                     body = Json.Document(response),
-                    Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri], User, Retries, Timeout, TargetResultSize)
+                    Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(Url, body[nextUri], sessionUser, Retries, Timeout, TargetResultSize)
                 in
                     Source
     in
         Table;
 
 
-PostStatementCatalogs = (url as text, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number) as table =>    
+PostStatementCatalogs = (url as text, optional Catalog as text, optional User as nullable text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number) as table =>
     let
         response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
-                        response = Web.Contents(url,
-                            [
-                                 Content = Text.ToBinary("show catalogs")
-                                ,Headers = [#"X-Trino-User" = User]
-                                ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
-                            ]
-                        ),                        
+                        response = TrinoRequest(url, User, Timeout, isRetry, [Content = Text.ToBinary("show catalogs")]),
                         buffered = Binary.Buffer(response),
                         responseCode = Value.Metadata(response)[Response.Status],
                         actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -139,24 +169,17 @@ PostStatementCatalogs = (url as text, optional Catalog as text, optional User as
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)        
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(url, body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         if Catalog = null then Source else #table({"Catalog"}, {{Catalog}});
 
-PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementSchemas = (url as text, Catalog as text, User as nullable text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>
     let
         response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
-                        response = Web.Contents(url,
-                            [
-                                 Content = Text.ToBinary("select schema_name from """ & Catalog & """.information_schema.schemata")
-                                ,Headers = [#"X-Trino-User" = User]
-                                ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
-                            ]
-                        ),
+                        response = TrinoRequest(url, User, Timeout, isRetry, [Content = Text.ToBinary("select schema_name from """ & Catalog & """.information_schema.schemata")]),
                         buffered = Binary.Buffer(response),
                         responseCode = Value.Metadata(response)[Response.Status],
                         actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -165,24 +188,17 @@ PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as n
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(url, body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
-PostStatementTables = (url as text, Catalog as text, Schema as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementTables = (url as text, Catalog as text, Schema as text, User as nullable text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>
     let
         response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
-                        response = Web.Contents(url, 
-                            [
-                                 Content = Text.ToBinary("select table_name, table_schema from """ & Catalog & """.information_schema.tables where table_schema = '" & Schema & "'")
-                                ,Headers = [#"X-Trino-User" = User]
-                                ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry                                
-                            ]
-                        ), 
+                        response = TrinoRequest(url, User, Timeout, isRetry, [Content = Text.ToBinary("select table_name, table_schema from """ & Catalog & """.information_schema.tables where table_schema = '" & Schema & "'")]),
                         buffered = Binary.Buffer(response),
                         responseCode = Value.Metadata(response)[Response.Status],
                         actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -191,25 +207,18 @@ PostStatementTables = (url as text, Catalog as text, Schema as text, User as tex
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(url, body[nextUri],User,Retries,Timeout,TargetResultSize)
 
      in
         Source;
 
-PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  => 
+PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, table as text, User as nullable text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>
     let      
        response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
-                        response = Web.Contents(url, 
-                            [
-                                 Content = Text.ToBinary("select column_name from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
-                                ,Headers = [#"X-Trino-User" = User]
-                                ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
-                            ]
-                        ), 
+                        response = TrinoRequest(url, User, Timeout, isRetry, [Content = Text.ToBinary("select column_name from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")]),
                         buffered = Binary.Buffer(response),
                         responseCode = Value.Metadata(response)[Response.Status],
                         actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -218,11 +227,11 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(url, body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
-PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as nullable text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>
     let   
         //get and prepare column names
         ColumnNamesTable = PostStatementQueryColumnNames(url,Catalog,schema,table,User,Retries,Timeout,TargetResultSize),
@@ -238,14 +247,7 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
-                        response = Web.Contents(url, 
-                            [
-                                 Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """")
-                                ,Headers = [#"X-Trino-User" = User]
-                                ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
-                            ]
-                        ), 
+                        response = TrinoRequest(url, User, Timeout, isRetry, [Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """")]),
                         buffered = Binary.Buffer(response),
                         responseCode = Value.Metadata(response)[Response.Status],
                         actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -254,7 +256,7 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(url, body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
@@ -272,7 +274,7 @@ TrinoTypeToPowerQueryType = (trinoType as text) as type =>
     else if Text.Contains(trinoType, "varbinary") then type binary //VARBINARY
     else type text; //INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, IPADDRESS, UUID
 
-GetPage = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
+GetPage = (url as text, User as nullable text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
     let        
         Query = 
             if TargetResultSize <> null then
@@ -283,14 +285,7 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
-                        response = Web.Contents(url, 
-                            [
-                                 Headers = [#"X-Trino-User" = User]
-                                ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry   
-                                ,Query = Query                          
-                            ]
-                        ), 
+                        response = TrinoRequest(url, User, Timeout, isRetry, [Query = Query]),
                         buffered = Binary.Buffer(response),
                         responseCode = Value.Metadata(response)[Response.Status],
                         actualResult = if buffered <> null and responseCode = 200 then buffered else null
@@ -368,11 +363,8 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
 ///// NAVIGATION //////
 ///////////////////////
 
-TrinoNavTable = (url as text, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number) as table =>
+TrinoNavTable = (url as text, optional Catalog as text, optional User as nullable text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number) as table =>
     let
-        User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
-               else if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) = "UsernamePassword" then Extension.CurrentCredential()[Username] 
-               else User,
         Retries = if Retries is null then DefaultRetries else Retries,
         Timeout = if Timeout is null then DefaultTimeout else Timeout,
         catalogs = PostStatementCatalogs(url,Catalog,User,Retries,Timeout,TargetResultSize),
@@ -390,7 +382,7 @@ TrinoNavTable = (url as text, optional Catalog as text, optional User as text, o
         IsLeafColumn = Table.AddColumn(ItemNameColumn,"IsLeaf", each false),
         source = IsLeafColumn,
         //navTable = Table.ToNavigationTable(source, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
-        AsNavigationView = Table.NavigationTableView(() => source, {"Url","NameKey","User","Retries","Timeout","TargetResultSize"}, TrinoNavTableLeaf, [
+        AsNavigationView = Table.NavigationTableView(url, () => source, {"Url","NameKey","User","Retries","Timeout","TargetResultSize"}, TrinoNavTableLeaf, [
             Name = each [Name],
             ItemKind = each [ItemKind],
             ItemName = each [ItemName],
@@ -399,11 +391,8 @@ TrinoNavTable = (url as text, optional Catalog as text, optional User as text, o
     in
         AsNavigationView;
 
-TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number)  as table =>
+TrinoNavTableLeaf = (url as text, Catalog as text, optional User as nullable text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number)  as table =>
     let      
-        User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
-               else if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) = "UsernamePassword" then Extension.CurrentCredential()[Username] 
-               else User,
         Retries = if Retries is null then DefaultRetries else Retries,
         Timeout = if Timeout is null then DefaultTimeout else Timeout,
         schemas = PostStatementSchemas(url,Catalog,User,Retries,Timeout,TargetResultSize),
@@ -422,7 +411,7 @@ TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, option
         IsLeafColumn = Table.AddColumn(ItemNameColumn,"IsLeaf", each false),
         source = IsLeafColumn,
         //navTable = Table.ToNavigationTable(source, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf"),
-        AsNavigationView = Table.NavigationTableView(() => source, {"Url","Catalog","NameKey","User","Retries","Timeout","TargetResultSize"}, TrinoNavTableLeafLeaf, [
+        AsNavigationView = Table.NavigationTableView(url, () => source, {"Url","Catalog","NameKey","User","Retries","Timeout","TargetResultSize"}, TrinoNavTableLeafLeaf, [
             Name = each [Name],
             ItemKind = each [ItemKind],
             ItemName = each [ItemName],
@@ -431,11 +420,8 @@ TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, option
     in
         AsNavigationView;
 
-TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number)  as table =>
+TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional User as nullable text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number)  as table =>
     let
-        User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
-               else if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) = "UsernamePassword" then Extension.CurrentCredential()[Username] 
-               else User,
         Retries = if Retries is null then DefaultRetries else Retries,
         Timeout = if Timeout is null then DefaultTimeout else Timeout,
         tables = PostStatementTables(url,Catalog,Schema,User,Retries,Timeout,TargetResultSize),
@@ -457,7 +443,7 @@ TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional 
         IsLeafColumn = Table.AddColumn(ItemNameColumn,"IsLeaf", each true),        
         source = IsLeafColumn,
         //navTable = Table.ToNavigationTable(source, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
-        AsNavigationView = Table.NavigationTableView(() => source, {"Url","Catalog","Schema","Table","User","Retries","Timeout","TargetResultSize"},  PostStatementQueryTables, [
+        AsNavigationView = Table.NavigationTableView(url, () => source, {"Url","Catalog","Schema","Table","User","Retries","Timeout","TargetResultSize"},  PostStatementQueryTables, [
              Name = each [Name],
              ItemKind = each [ItemKind],
              ItemName = each [ItemName],
@@ -471,20 +457,23 @@ TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional 
 //// DATA SOURCE /////
 //////////////////////
 
-// OAuth2 values
-redirect_uri = "https://oauth.powerbi.com/views/oauthredirect.html";
-client_id = Text.FromBinary(Extension.Contents("oauth_config_client_id.txt"));
-client_secret = Text.FromBinary(Extension.Contents("oauth_config_client_secret.txt"));
-authorize_uri = Text.FromBinary(Extension.Contents("oauth_config_authorize_uri.txt"));
-scopes = Text.FromBinary(Extension.Contents("oauth_config_scopes.txt"));
-token_uri = Text.FromBinary(Extension.Contents("oauth_config_token_uri.txt"));
+// The build-local resource contains non-secret deployment identifiers.
+EntraSetting = (name as text) as text =>
+    let
+        config = try Json.Document(Extension.Contents("entra.local.json"))
+                 otherwise error "Build the connector with the approved entra.local.json settings to use organizational sign-in.",
+        value = Record.FieldOrDefault(config, name)
+    in
+        if value is text and Text.Trim(value) <> "" then Text.Trim(value)
+        else error ("Missing Entra setting: " & name);
 
 //Data Source Kind description
 Trino = [
     Authentication = [
-        OAuth = [
-            StartLogin = StartLogin,
-            FinishLogin = FinishLogin
+        Aad = [
+            AuthorizationUri = (path) => EntraSetting("AuthorizationUri"),
+            Resource = (path) => EntraSetting("Resource"),
+            Scope = (path) => EntraSetting("Scope")
         ],
         UsernamePassword = [
             UsernameLabel = Extension.LoadString("UsernameLabelText"),
@@ -501,52 +490,6 @@ Trino = [
             { "Trino.Contents", host, port }
     //Label = "Trino"
 ];
-
-// OAuth helper functions: StartLogin, FinishLogin, Token Method
-StartLogin = (resourceUrl, state, display) =>
-    let
-        AuthorizeUrl = authorize_uri & "?" & Uri.BuildQueryString([
-            response_type = "code",
-            client_id = client_id,  
-            redirect_uri = redirect_uri,
-            state = state,
-            scope = scopes
-        ])
-    in
-        [
-            LoginUri = AuthorizeUrl,
-            CallbackUri = redirect_uri,
-            WindowHeight = 720,
-            WindowWidth = 1024,
-            Context = null
-        ];
-
-FinishLogin = (context, callbackUri, state) =>
-    let
-        Parts = Uri.Parts(callbackUri)[Query]
-    in
-        TokenMethod(Parts[code]);
-
-// Base64Encode(client_id:client_secret)
-// https://docs.aws.amazon.com/cognito/latest/developerguide/token-endpoint.html
-client_id_secret = client_id & ":" & client_secret;
-client_id_secret_bytes = Text.ToBinary(client_id_secret);
-client_id_secret_base64 = Binary.ToText(client_id_secret_bytes);
-
-TokenMethod = (code) =>
-    let
-        Response = Web.Contents(token_uri, [
-            Content = Text.ToBinary(Uri.BuildQueryString([
-                grant_type = "authorization_code",
-                client_id = client_id,
-                code = code,
-                redirect_uri = redirect_uri])),
-            Headers=[
-                #"Content-Type" = "application/x-www-form-urlencoded",
-                #"Authorization" = "Basic " & client_id_secret_base64]]),
-        Parts = Json.Document(Response)
-    in
-        Parts;
 
 // Data Source UI publishing description
 Trino.Publish = [
@@ -574,14 +517,13 @@ GetNextLink = (response) as nullable text => Record.FieldOrDefault(response, "ne
 // Read all pages of data.
 // After every page, we check the "NextLink" record on the metadata of the previous request.
 // Table.GenerateByPage will keep asking for more pages until we return null.
-GetAllPagesByNextLink = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>    
+GetAllPagesByNextLink = (statementUrl as text, url as text, User as nullable text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
     Table.GenerateByPage((previous) => 
         let
-            User = if User is null then DefaultUser else User,
             // if previous is null, then this is our first page of data
             nextLink = if (previous = null) then url else Value.Metadata(previous)[NextLink]?,
             // if NextLink was set to null by the previous call, we know we have no more data
-            page = if (nextLink <> null) then GetPage(nextLink,User,Retries,Timeout,TargetResultSize) else null
+            page = if (nextLink <> null) then GetPage(CheckedPageUrl(statementUrl, nextLink),User,Retries,Timeout,TargetResultSize) else null
         in
             page
     );
@@ -656,6 +598,7 @@ Table.GenerateByPage = (getNextPage as function) as table =>
 
 Table.NavigationTableView =
 (
+    statementUrl as text,
     baseTable as function,
     keyColumns as list,
     dataCtor as function,
@@ -710,7 +653,7 @@ Table.NavigationTableView =
                     index = try getIndex(selector, keyColumns) otherwise [],
                     default = Table.SelectRows(GetRows(), selector)
                 in
-                    if Record.FieldCount(index) <> List.Count(keyColumns) then default
+                    if Record.FieldCount(index) <> List.Count(keyColumns) or index[Url]? <> statementUrl then default
                     else Table.FromRecords({
                         index & lazyRecord(
                             () => Table.First(default),

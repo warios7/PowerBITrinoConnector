@@ -1,1 +1,4 @@
 oauth_config_*
+entra.local.json
+/Trino/bin/
+/Trino/obj/

@@ -68,6 +68,9 @@
     <Compile Include="resources.resx">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="entra.local.json" Condition="Exists('entra.local.json')">
+      <SubType>Content</SubType>
+    </Compile>
     <Compile Include="Diagnostics.pqm">
       <SubType>Content</SubType>
     </Compile>
