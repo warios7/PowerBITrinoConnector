@@ -100,7 +100,7 @@ TrinoRequest = (url as text, user as nullable text, timeout as number, isRetry a
             if IsAnonymous then [#"X-Trino-User" = user]
             else if not Text.StartsWith(url, "https://", Comparer.OrdinalIgnoreCase) then
                 error "Authenticated Trino requests require HTTPS."
-            else if List.Contains({"Aad", "OAuth"}, kind) then
+            else if kind = "OAuth" then
                 // Scope the API token to the gateway approved for this resource.
                 if CheckedPageUrl(EntraSetting("GatewayOrigin"), url) = url then
                     [Authorization = "Bearer " & credential[access_token]]
@@ -467,13 +467,81 @@ EntraSetting = (name as text) as text =>
         if value is text and Text.Trim(value) <> "" then Text.Trim(value)
         else error ("Missing Entra setting: " & name);
 
+// Desktop proof of concept. The loopback page receives only the browser link
+// and Power Query state. The token polling URL stays in the connector context.
+DesktopCallback = "https://oauth.powerbi.com/views/oauthredirect.html";
+
+ChallengeUrl = (header as text, name as text, origin as text) as text =>
+    let
+        fields = List.Transform(Text.Split(header, ","), Text.Trim),
+        parameters = List.Transform(fields, each if Text.StartsWith(_, "Bearer ", Comparer.OrdinalIgnoreCase)
+            then Text.Trim(Text.Range(_, 7)) else _),
+        matches = List.Select(parameters, each Text.Lower(Text.Trim(Text.BeforeDelimiter(_, "="))) = name),
+        value = if List.Count(matches) = 1
+            then Text.Trim(Text.Trim(Text.AfterDelimiter(matches{0}, "=")), """")
+            else error ("The gateway did not return a unique " & name & " challenge.")
+    in
+        CheckedPageUrl(origin, value);
+
+StartLogin = (dataSourcePath, state, display) =>
+    let
+        path = Json.Document(dataSourcePath),
+        origin = "https://" & path[Host] & ":" & Number.ToText(path[Port], "0", "en-US"),
+        statement = CheckedPageUrl(EntraSetting("GatewayOrigin"), origin & "/v1/statement"),
+        response = Web.Contents(statement, [
+            Content = Text.ToBinary("SELECT current_user"),
+            ManualCredentials = true, IsRetry = true, ManualStatusHandling = {300..499}
+        ]),
+        metaRecord = Value.Metadata(response),
+        headers = if metaRecord[Response.Status] = 401 then metaRecord[Headers]
+                  else error "Expected a Trino HTTP 401 external authentication challenge.",
+        headerName = List.First(List.Select(Record.FieldNames(headers),
+            each Text.Lower(_) = "www-authenticate"), null),
+        raw = if headerName = null then error "Gateway response lacks WWW-Authenticate."
+              else Record.Field(headers, headerName),
+        header = if raw is list then Text.Combine(raw, ",") else raw,
+        login = ChallengeUrl(header, "x_redirect_server", origin),
+        poll = ChallengeUrl(header, "x_token_server", origin)
+    in
+        [
+            LoginUri = "http://127.0.0.1:18765/index.html#" & Uri.BuildQueryString([login = login, state = state]),
+            CallbackUri = DesktopCallback,
+            WindowHeight = 600,
+            WindowWidth = 760,
+            Context = [Origin = origin, Poll = poll, State = state]
+        ];
+
+ReadTrinoToken = (origin as text, uri as text, attempts as number) as record =>
+    let
+        response = try Web.Contents(CheckedPageUrl(origin, uri), [
+            ManualCredentials = true, IsRetry = true,
+            ManualStatusHandling = {300..599}, Timeout = #duration(0, 0, 0, 30)
+        ]) otherwise error "The Trino token request failed. Restart sign-in.",
+        body = if Value.Metadata(response)[Response.Status] = 200 then Json.Document(response)
+               else error "The gateway rejected the token request. Restart sign-in."
+    in
+        if body[error]? <> null then error "Trino rejected the sign-in. Restart sign-in."
+        else if body[token]? is text and body[token] <> "" then
+            [access_token = body[token], token_type = "Bearer"]
+        else if attempts > 1 and body[nextUri]? is text then
+            Function.InvokeAfter(() => @ReadTrinoToken(origin, body[nextUri], attempts - 1), #duration(0, 0, 0, 1))
+        else error "Trino did not complete sign-in. Restart sign-in.";
+
+FinishLogin = (context, callbackUri, state) =>
+    let
+        returned = Uri.Parts(callbackUri)[Query][state]?
+    in
+        if returned = null or returned <> state or returned <> context[State] then
+            error "Power BI sign-in state mismatch."
+        else ReadTrinoToken(context[Origin], context[Poll], 5);
+
 //Data Source Kind description
 Trino = [
     Authentication = [
-        Aad = [
-            AuthorizationUri = (path) => EntraSetting("AuthorizationUri"),
-            Resource = (path) => EntraSetting("Resource"),
-            Scope = (path) => EntraSetting("Scope")
+        OAuth = [
+            Label = "Trino browser sign-in (test)",
+            StartLogin = StartLogin,
+            FinishLogin = FinishLogin
         ],
         UsernamePassword = [
             UsernameLabel = Extension.LoadString("UsernameLabelText"),

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>Trino sign-in for Power BI Desktop</title>
+<h1>Sign in to Trino</h1>
+<p id="message">Start this page from the Trino connector in Power BI Desktop.</p>
+<div id="steps" hidden>
+  <p><a id="login" target="_blank" rel="noopener noreferrer">Open Trino sign-in</a></p>
+  <p>If the window does not open, copy the sign-in link and open it in your browser.
+  Once Trino confirms success, return here.</p>
+  <p><a id="done">Finish in Power BI</a></p>
+</div>
+<script>
+const params = new URLSearchParams(location.hash.slice(1));
+const login = params.get("login");
+const state = params.get("state");
+if (login && state) {
+  const url = new URL(login);
+  if (url.protocol === "https:" && !url.username && !url.password) {
+    const callback = new URL("https://oauth.powerbi.com/views/oauthredirect.html");
+    callback.searchParams.set("state", state);
+    document.querySelector("#login").href = url.href;
+    document.querySelector("#done").href = callback.href;
+    document.querySelector("#message").textContent = "Open " + url.host + " to sign in.";
+    document.querySelector("#steps").hidden = false;
+  }
+}
+</script>
+</html>
