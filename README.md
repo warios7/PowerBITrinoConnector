@@ -19,10 +19,10 @@ This experimental Windows Desktop build uses Trino's external authentication cha
 
 1. In a Windows checkout, select `codex/trino-managed-oauth-test`. Keep the installed Aad package outside the custom connectors directory as a rollback copy.
 2. Use the existing ignored `Trino/entra.local.json` if its `GatewayOrigin` matches your gateway. This branch reads only that field. For a fresh build, copy `entra.example.json` to `Trino/entra.local.json` and enter the HTTPS origin. Both the browser initiation URL and token server in Trino's challenge must use that origin.
-3. From the repository root start the test page with Python 3 on Windows. Leave this terminal open through sign-in. The command serves only the included static HTML directory on IPv4 loopback. If the port is occupied, stop here and resolve the conflict before testing.
+3. From the repository root start the test page with Windows PowerShell. Leave this terminal open through sign-in. The command serves only the included static sign-in page on IPv4 loopback. If the port is occupied, stop here and resolve the conflict before testing.
 
    ```powershell
-   py -3 -m http.server 18765 --bind 127.0.0.1 --directory desktop-login
+   .\desktop-login\Start-TrinoLogin.ps1
    ```
 
 4. Open the **Trino** subfolder in VS Code and run **Build connector project using MakePQX**. Close Desktop and install the rebuilt `Trino/bin/AnyCPU/Debug/Trino.mez` in the user's Desktop custom connectors directory. Keep one Trino connector in that directory.
