@@ -77,20 +77,23 @@ DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
 IsAnonymous = List.Contains({"Anonymous", "Implicit"}, Extension.CurrentCredential()[AuthenticationKind]);
 Http = if IsAnonymous then "http://" else "https://";
 
-// Bind every page to the gateway that received the original statement.
-CheckedPageUrl = (statementUrl as text, nextUrl as text) as text =>
+// Report only the failed check. Challenge URLs can contain one-time credentials.
+CheckedGatewayUrl = (expectedUrl as text, url as text, stage as text) as text =>
     let
-        origin = Uri.Parts(statementUrl),
-        page = Uri.Parts(nextUrl)
+        fail = (reason as text) => error ("Trino " & stage & ": " & reason),
+        origin = try Uri.Parts(expectedUrl) otherwise fail("Invalid reference gateway URL."),
+        target = try Uri.Parts(url) otherwise fail("Invalid destination URL."),
+        effectivePort = (parts as record) =>
+            parts[Port]? ?? (if Text.Lower(parts[Scheme]) = "https" then 443 else 80)
     in
-        if Text.StartsWith(nextUrl, origin[Scheme] & "://", Comparer.OrdinalIgnoreCase)
-            and Text.Lower(page[Host]) = Text.Lower(origin[Host])
-            and page[Port] = origin[Port]
-            and List.Contains({null, ""}, page[UserName]?)
-            and List.Contains({null, ""}, page[Password]?)
-            and not Text.Contains(nextUrl, Character.FromNumber(92))
-        then nextUrl
-        else error "Trino returned a pagination URL outside the configured gateway origin.";
+        if Text.Contains(url, Character.FromNumber(92)) then fail("Backslash in destination URL.")
+        else if not Text.StartsWith(url, origin[Scheme] & "://", Comparer.OrdinalIgnoreCase) then
+            fail("Destination must be an absolute URL with the gateway scheme.")
+        else if Text.Lower(target[Host]) <> Text.Lower(origin[Host]) then fail("Gateway hostname differs.")
+        else if effectivePort(target) <> effectivePort(origin) then fail("Gateway port differs.")
+        else if not List.Contains({null, ""}, target[UserName]?)
+            or not List.Contains({null, ""}, target[Password]?) then fail("Destination contains user information.")
+        else url;
 
 TrinoRequest = (url as text, user as nullable text, timeout as number, isRetry as logical, options as record) as binary =>
     let
@@ -102,7 +105,7 @@ TrinoRequest = (url as text, user as nullable text, timeout as number, isRetry a
                 error "Authenticated Trino requests require HTTPS."
             else if kind = "OAuth" then
                 // Scope the API token to the gateway approved for this resource.
-                if CheckedPageUrl(EntraSetting("GatewayOrigin"), url) = url then
+                if CheckedGatewayUrl(EntraSetting("GatewayOrigin"), url, "authenticated request") = url then
                     [Authorization = "Bearer " & credential[access_token]]
                 else error "Invalid gateway origin."
             else if kind = "UsernamePassword" then
@@ -481,13 +484,13 @@ ChallengeUrl = (header as text, name as text, origin as text) as text =>
             then Text.Trim(Text.Trim(Text.AfterDelimiter(matches{0}, "=")), """")
             else error ("The gateway did not return a unique " & name & " challenge.")
     in
-        CheckedPageUrl(origin, value);
+        CheckedGatewayUrl(origin, value, name);
 
 StartLogin = (dataSourcePath, state, display) =>
     let
         path = Json.Document(dataSourcePath),
         origin = "https://" & path[Host] & ":" & Number.ToText(path[Port], "0", "en-US"),
-        statement = CheckedPageUrl(EntraSetting("GatewayOrigin"), origin & "/v1/statement"),
+        statement = CheckedGatewayUrl(EntraSetting("GatewayOrigin"), origin & "/v1/statement", "Desktop connection settings"),
         response = Web.Contents(statement, [
             Content = Text.ToBinary("SELECT current_user"),
             ManualCredentials = true, IsRetry = true, ManualStatusHandling = {300..499}
@@ -513,10 +516,12 @@ StartLogin = (dataSourcePath, state, display) =>
 
 ReadTrinoToken = (origin as text, uri as text, attempts as number) as record =>
     let
-        response = try Web.Contents(CheckedPageUrl(origin, uri), [
+        checked = CheckedGatewayUrl(origin, uri, "token polling"),
+        response = if checked = uri then try Web.Contents(checked, [
             ManualCredentials = true, IsRetry = true,
             ManualStatusHandling = {300..599}, Timeout = #duration(0, 0, 0, 30)
-        ]) otherwise error "The Trino token request failed. Restart sign-in.",
+        ]) otherwise error "The Trino token request failed. Restart sign-in."
+            else error "Invalid token polling URL.",
         body = if Value.Metadata(response)[Response.Status] = 200 then Json.Document(response)
                else error "The gateway rejected the token request. Restart sign-in."
     in
@@ -591,7 +596,7 @@ GetAllPagesByNextLink = (statementUrl as text, url as text, User as nullable tex
             // if previous is null, then this is our first page of data
             nextLink = if (previous = null) then url else Value.Metadata(previous)[NextLink]?,
             // if NextLink was set to null by the previous call, we know we have no more data
-            page = if (nextLink <> null) then GetPage(CheckedPageUrl(statementUrl, nextLink),User,Retries,Timeout,TargetResultSize) else null
+            page = if (nextLink <> null) then GetPage(CheckedGatewayUrl(statementUrl, nextLink, "query pagination"),User,Retries,Timeout,TargetResultSize) else null
         in
             page
     );
